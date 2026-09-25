@@ -10,6 +10,10 @@
     ("Coping"   "COP" 6 "Thickness"))
 )
 
+(if (not *qto_csv_saved_path*) (setq *qto_csv_saved_path* nil))
+
+(if (not *qto_last_vert_dim*) (setq *qto_last_vert_dim* 0.50))
+
 ;; Helper: Save custom categories to DWG Named Object Dictionary
 (defun qto_save_categories_to_dwg ()
   (vl-load-com)
@@ -39,7 +43,7 @@
 (if (not *qto_active_cat*) (setq *qto_active_cat* "Footings"))
 
 ;; Main Command: Scan DWG for saved XData first, then launch dialog
-(defun c:QTOMANAGER (/ result)
+(defun c:MYQTO (/ result)
   (vl-load-com)
   (regapp "QTO_DATA_APP")
   
@@ -58,8 +62,7 @@
 ;; XDATA PERSISTENCE ENGINE (READ / WRITE TO DWG OBJECTS)
 ;; =========================================================================
 
-;; Attach Data directly to Polyline entity inside DWG
-(defun qto_write_xdata (ent cat_name tag_name vert_dim shape_label / exdata)
+(defun qto_write_xdata (ent cat_name tag_name vert_dim shape_label nos work_type / exdata)
   (regapp "QTO_DATA_APP")
   (setq exdata
     (list 
@@ -69,6 +72,8 @@
           (cons 1000 tag_name)
           (cons 1040 (float vert_dim))
           (cons 1000 shape_label)
+          (cons 1070 (fix nos))
+          (cons 1000 work_type) ; "Regular" or "Rework"
         )
       )
     )
@@ -76,8 +81,7 @@
   (entmod (append (entget ent) exdata))
 )
 
-;; Read DWG database and recover all saved objects into memory
-(defun qto_sync_data_from_dwg (/ ss i ent obj xdata xlist cat_name tag_name vert_dim shape_label area dims len wid minpt maxpt text_pt txt_h ent_txt)
+(defun qto_sync_data_from_dwg (/ ss i ent obj xdata cat_name tag_name vert_dim shape_label nos work_type area dims len wid minpt maxpt text_pt ent_txt)
   (setq *qto_data* nil)
   (setq ss (ssget "X" '((0 . "LWPOLYLINE,POLYLINE") (-3 ("QTO_DATA_APP")))))
   (if ss
@@ -93,24 +97,22 @@
             (setq tag_name (cdr (nth 2 xdata)))
             (setq vert_dim (cdr (nth 3 xdata)))
             (setq shape_label (cdr (nth 4 xdata)))
+            (setq nos (if (nth 5 xdata) (cdr (nth 5 xdata)) 1))
+            (setq work_type (if (nth 6 xdata) (cdr (nth 6 xdata)) "Regular"))
             (setq area (vla-get-area obj))
-
             (setq dims (get_accurate_len_wid ent))
             (setq len (car dims))
             (setq wid (cadr dims))
-
-            ;; Find text entity matching key coordinates/layer
             (vla-getboundingbox obj 'minpt 'maxpt)
             (setq minpt (vlax-safearray->list minpt))
             (setq maxpt (vlax-safearray->list maxpt))
             (setq text_pt (list (/ (+ (car minpt) (car maxpt)) 2.0) (/ (+ (cadr minpt) (cadr maxpt)) 2.0) 0.0))
-
             (setq ent_txt (qto_find_associated_text text_pt tag_name (strcat "QTO_" (strcase cat_name))))
             
-            ;; Reconstruct memory item
+            ;; Index: 0:cat 1:tag 2:len 3:wid 4:area 5:vert 6:vol 7:shape 8:nos 9:work_type 10:ent 11:ent_txt
             (setq *qto_data* 
               (append *qto_data* 
-                (list (list cat_name tag_name len wid area vert_dim (* area vert_dim) shape_label ent ent_txt))
+                (list (list cat_name tag_name len wid area vert_dim (* area vert_dim nos) shape_label nos work_type ent ent_txt))
               )
             )
           )
@@ -297,6 +299,8 @@
   (write-line "  : boxed_row { label = \"Edit / Delete Selected Record\";" f)
   (write-line "    : edit_box { label = \"Tag Name:\"; key = \"eb_tag\"; edit_width = 10; }" f)
   (write-line "    : edit_box { key = \"eb_vert_dim\"; label = \"Depth (m):\"; edit_width = 8; }" f)
+  (write-line " : edit_box { label = \"Nos:\"; key = \"eb_nos\"; edit_width = 5; }" f)
+  (write-line "    : popup_list { label = \"Work:\"; key = \"pop_mgr_work\"; edit_width = 9; }" f)
   (write-line "    : button { label = \"Apply Changes\"; key = \"btn_update\"; }" f)
   (write-line "    : button { label = \"Delete Item\"; key = \"btn_delete_item\"; }" f)
   (write-line "    : button { label = \"Zoom & Highlight\"; key = \"btn_locate\"; }" f)
@@ -360,30 +364,43 @@
   (if (findfile dcl_file) (vl-file-delete dcl_file))
 )
 
-(defun update_active_qto_list_ui (/ total_vol display_list item vol shape_str tag_str filtered_data vert_lbl)
+(defun update_active_qto_list_ui (/ total_vol display_list item vol shape_str tag_str filtered_data vert_lbl nos_val work_val)
   (setq total_vol 0.0)
   (setq vert_lbl (strcase (substr (nth 3 (assoc *qto_active_cat* *qto_categories*)) 1 1)))
-  (setq display_list (list (format_col "TAG" 10) (format_col "SHAPE" 14) (format_col "L(m)" 8) (format_col "W(m)" 8) (format_col "AREA(m2)" 10) (format_col (strcat vert_lbl "(m)") 8) (format_col "VOL(m3)" 10)))
   
+  ;; Table Header: TAG | SHAPE | NOS | L(m) | W(m) | AREA(m2) | D/T(m) | VOL(m3) | WORK
+  (setq display_list (list (format_col "TAG" 8) 
+                           (format_col "SHAPE" 13) 
+                           (format_col "NOS" 5)
+                           (format_col "L(m)" 8) 
+                           (format_col "W(m)" 8) 
+                           (format_col "AREA(m2)" 11) 
+                           (format_col (strcat vert_lbl "(m)") 7) 
+                           (format_col "VOL(m3)" 11)
+                           (format_col "WORK" 8)))
   (start_list "data_list")
-  (add_list (strcat (nth 0 display_list) (nth 1 display_list) (nth 2 display_list) (nth 3 display_list) (nth 4 display_list) (nth 5 display_list) (nth 6 display_list)))
-  (add_list "----------------------------------------------------------------------------------")
+  (add_list (apply 'strcat display_list))
+  (add_list "------------------------------------------------------------------------------------------------------")
   
   (setq filtered_data (vl-remove-if-not '(lambda (x) (equal (nth 0 x) *qto_active_cat*)) *qto_data*))
-
   (foreach item filtered_data
     (setq vol (nth 6 item))
     (setq total_vol (+ total_vol vol))
     (setq shape_str (nth 7 item))
     (setq tag_str (nth 1 item))
+    (setq nos_val (if (and (> (length item) 8) (numberp (nth 8 item))) (nth 8 item) 1))
+    (setq work_val (if (> (length item) 9) (nth 9 item) "Regular"))
+    
     (add_list (strcat 
-      (format_col tag_str 10)
-      (format_col shape_str 14)
+      (format_col tag_str 8)
+      (format_col shape_str 13)
+      (format_col (itoa nos_val) 5)
       (format_col (rtos (nth 2 item) 2 2) 8)
       (format_col (rtos (nth 3 item) 2 2) 8)
-      (format_col (rtos (nth 4 item) 2 2) 10)
-      (format_col (rtos (nth 5 item) 2 2) 8)
-      (format_col (rtos vol 2 3) 10)
+      (format_col (rtos (nth 4 item) 2 2) 11)
+      (format_col (rtos (nth 5 item) 2 2) 7)
+      (format_col (rtos vol 2 3) 11)
+      (format_col work_val 8)
     ))
   )
   (end_list)
@@ -396,47 +413,44 @@
   str
 )
 
-(defun register_qto_entity (ent shape_label / cat_info prefix layer_name count area tag vert_dim vol minpt maxpt dims len wid text_pt txt_h ent_txt obj)
+(defun register_qto_entity (ent shape_label / cat_info prefix layer_name count area tag val_res vert_dim nos work_type vol minpt maxpt dims len wid text_pt txt_h ent_txt obj)
   (setq obj (vlax-ename->vla-object ent))
   (if (and (vlax-property-available-p obj 'Area) (> (vla-get-area obj) 0.0))
     (progn
       (setq layer_name (ensure_qto_layer_exists *qto_active_cat*))
       (vla-put-layer obj layer_name)
-
       (setq cat_info (assoc *qto_active_cat* *qto_categories*))
       (setq prefix (nth 1 cat_info))
       
       (setq count (1+ (length (vl-remove-if-not '(lambda (x) (equal (nth 0 x) *qto_active_cat*)) *qto_data*))))
       (setq tag (strcat prefix "-" (itoa count)))
       (setq area (vla-get-area obj))
-
       (setq dims (get_accurate_len_wid ent))
       (setq len (car dims))
       (setq wid (cadr dims))
-
       (vla-getboundingbox obj 'minpt 'maxpt)
       (setq minpt (vlax-safearray->list minpt))
       (setq maxpt (vlax-safearray->list maxpt))
-
       (setq text_pt (list (/ (+ (car minpt) (car maxpt)) 2.0) (/ (+ (cadr minpt) (cadr maxpt)) 2.0) 0.0))
-      (setq txt_h (max 0.2 (/ (- (car maxpt) (car minpt)) 6.0)))
-
+      ;(setq txt_h (max 0.2 (/ (- (car maxpt) (car minpt)) 6.0)))
+      (setq txt_h (max 0.15 (* (min (- (car maxpt) (car minpt)) (- (cadr maxpt) (cadr minpt))) 0.40)))
       (command "_TEXT" "_J" "_MC" "_non" text_pt txt_h "0" tag)
       (setq ent_txt (entlast))
       (vla-put-layer (vlax-ename->vla-object ent_txt) layer_name)
-
-      (setq vert_dim 0.50)
-      (setq vol (* area vert_dim))
-
-      ;; Store XData persistently inside DWG polyline entity
-      (qto_write_xdata ent *qto_active_cat* tag vert_dim shape_label)
-
-      (setq *qto_data* (append *qto_data* (list (list *qto_active_cat* tag len wid area vert_dim vol shape_label ent ent_txt))))
+      
+      ;; Get Depth, Nos, and Work Type
+      (setq val_res (qto_dialog_set_vert_dim))
+      (setq vert_dim (nth 0 val_res))
+      (setq nos      (nth 1 val_res))
+      (setq work_type(nth 2 val_res))
+      (setq vol (* area vert_dim nos))
+      
+      (qto_write_xdata ent *qto_active_cat* tag vert_dim shape_label nos work_type)
+      (setq *qto_data* (append *qto_data* (list (list *qto_active_cat* tag len wid area vert_dim vol shape_label nos work_type ent ent_txt))))
     )
     (alert "Selected entity is not closed or has zero area.")
   )
 )
-
 (defun get_clean_poly_vertices (ent / elist raw_pts clean_pts pt)
   (setq elist (entget ent))
   (setq raw_pts nil)
@@ -490,13 +504,95 @@
   (if ent (register_qto_entity ent "Picked Poly"))
 )
 
-(defun pick_and_calc_rect_qto (/ p1 p2)
-  (setq p1 (getpoint (strcat "\nSpecify first corner of " *qto_active_cat* ": ")))
-  (if p1 (setq p2 (getcorner p1 "\nSpecify opposite corner: ")))
-  (if (and p1 p2)
+(defun pick_and_calc_rect_qto (/ old_echo old_dyn old_prmpt old_divis old_pi last_ent new_ent)
+  ;; Juni settings save karo
+  (setq old_echo  (getvar "CMDECHO"))
+  (setq old_dyn   (getvar "DYNMODE"))
+  (setq old_prmpt (getvar "DYNPROMPT"))
+  (setq old_divis (getvar "DYNDIVIS"))
+  (setq old_pi    (getvar "DYNPICOORDS"))
+
+  ;; Degree bandh karva ane Length x Width boxes force karva:
+  (setvar "CMDECHO" 1)
+  (setvar "DYNMODE" 3)
+  (setvar "DYNPROMPT" 1)
+  (setvar "DYNDIVIS" 2)
+  (setvar "DYNPICOORDS" 0)   ;; 0 = Cartesian (Degree bandh, Length & Width box active)
+
+  (setq last_ent (entlast))
+
+  ;; Standard RECTANG command
+  (command "._RECTANG")
+  (while (> (getvar "CMDACTIVE") 0)
+    (command pause)
+  )
+
+  (setq new_ent (entlast))
+
+  ;; Settings normal karo
+  (setvar "CMDECHO" old_echo)
+  (setvar "DYNMODE" old_dyn)
+  (setvar "DYNPROMPT" old_prmpt)
+  (setvar "DYNDIVIS" old_divis)
+  (setvar "DYNPICOORDS" old_pi)
+
+  ;; QTO ma save karo
+  (if (and new_ent (not (equal last_ent new_ent)))
+    (register_qto_entity new_ent "Rectangular")
+  )
+)
+
+(defun qto_dialog_set_vert_dim (/ dcl_file f dcl_id user_val user_nos user_work what_next dim_name)
+  (setq dim_name (nth 3 (assoc *qto_active_cat* *qto_categories*)))
+  (if (null dim_name) (setq dim_name "Depth"))
+  
+  (setq dcl_file (vl-filename-mktemp "qto_val.dcl"))
+  (setq f (open dcl_file "w"))
+  (write-line "qto_set_val : dialog { label = \"Set Value\";" f)
+  (write-line "  : boxed_column {" f)
+  (write-line (strcat "    label = \"Specify Parameters for " *qto_active_cat* "\";") f)
+  (write-line (strcat "    : edit_box { label = \"" dim_name " (m): \"; key = \"eb_val\"; edit_width = 12; }") f)
+  (write-line "    : edit_box { label = \"Nos / Layers: \"; key = \"eb_nos\"; edit_width = 12; }" f)
+  (write-line "    : popup_list { label = \"Work Type: \"; key = \"pop_work\"; edit_width = 12; }" f)
+  (write-line "  }" f)
+  (write-line "  : row {" f)
+  (write-line "    : ok_button { label = \"Set & Continue\"; is_default = true; }" f)
+  (write-line "  }" f)
+  (write-line "}" f)
+  (close f)
+
+  (setq dcl_id (load_dialog dcl_file))
+  (if (not (new_dialog "qto_set_val" dcl_id))
+    (progn (if (findfile dcl_file) (vl-file-delete dcl_file)) (list *qto_last_vert_dim* 1 "Regular"))
     (progn
-      (command "_RECTANG" "_non" p1 "_non" p2)
-      (register_qto_entity (entlast) "Rectangular")
+      (set_tile "eb_val" (rtos *qto_last_vert_dim* 2 3))
+      (set_tile "eb_nos" "1")
+      
+      (start_list "pop_work")
+      (add_list "Regular")
+      (add_list "Rework")
+      (end_list)
+      (set_tile "pop_work" "0") ;; 0 = Regular (Default)
+      
+      (mode_tile "eb_val" 2)
+      
+      (action_tile "accept" 
+        "(setq user_val (atof (get_tile \"eb_val\")))
+         (setq user_nos (atoi (get_tile \"eb_nos\")))
+         (setq user_work (if (= (get_tile \"pop_work\") \"1\") \"Rework\" \"Regular\"))
+         (done_dialog 1)")
+      (setq what_next (start_dialog))
+      (unload_dialog dcl_id)
+      (if (findfile dcl_file) (vl-file-delete dcl_file))
+      
+      (if (and user_val (> user_val 0.0))
+        (setq *qto_last_vert_dim* user_val)
+        (setq user_val *qto_last_vert_dim*)
+      )
+      (if (or (null user_nos) (<= user_nos 0)) (setq user_nos 1))
+      (if (null user_work) (setq user_work "Regular"))
+      
+      (list user_val user_nos user_work)
     )
   )
 )
@@ -514,16 +610,24 @@
       (setq item (nth idx records))
       (set_tile "eb_tag" (nth 1 item))
       (set_tile "eb_vert_dim" (rtos (nth 5 item) 2 2))
+      (set_tile "eb_nos" (itoa (if (nth 8 item) (nth 8 item) 1)))
+      
+      (start_list "pop_mgr_work")
+      (add_list "Regular")
+      (add_list "Rework")
+      (end_list)
+      (set_tile "pop_mgr_work" (if (equal (nth 9 item) "Rework") "1" "0"))
     )
     (progn
       (setq cur_sel nil)
       (set_tile "eb_tag" "")
       (set_tile "eb_vert_dim" "")
+      (set_tile "eb_nos" "")
     )
   )
 )
 
-(defun handle_apply_changes (/ records item global_idx new_tag new_v area new_vol ent_poly ent_txt txt_obj)
+(defun handle_apply_changes (/ records item global_idx new_tag new_v new_nos new_work area new_vol ent_poly ent_txt txt_obj)
   (setq records (get_active_category_records))
   (if (and cur_sel (< cur_sel (length records)))
     (progn
@@ -531,14 +635,16 @@
       (setq global_idx (vl-position item *qto_data*))
       (setq new_tag (get_tile "eb_tag"))
       (setq new_v (atof (get_tile "eb_vert_dim")))
+      (setq new_nos (atoi (get_tile "eb_nos")))
+      (setq new_work (if (= (get_tile "pop_mgr_work") "1") "Rework" "Regular"))
+      (if (<= new_nos 0) (setq new_nos 1))
       
       (if (and (> (strlen new_tag) 0) (> new_v 0.0))
         (progn
           (setq area (nth 4 item))
-          (setq new_vol (* area new_v))
-          (setq ent_poly (nth 8 item))
-          (setq ent_txt (nth 9 item))
-
+          (setq new_vol (* area new_v new_nos))
+          (setq ent_poly (nth 10 item))
+          (setq ent_txt  (nth 11 item))
           (if (and ent_txt (entget ent_txt))
             (progn
               (setq txt_obj (vlax-ename->vla-object ent_txt))
@@ -546,15 +652,11 @@
               (vla-update txt_obj)
             )
           )
-
-          ;; Update DWG entity XData
-          (qto_write_xdata ent_poly *qto_active_cat* new_tag new_v (nth 7 item))
-
-          (setq item (list *qto_active_cat* new_tag (nth 2 item) (nth 3 item) area new_v new_vol (nth 7 item) ent_poly ent_txt))
+          (qto_write_xdata ent_poly *qto_active_cat* new_tag new_v (nth 7 item) new_nos new_work)
+          (setq item (list *qto_active_cat* new_tag (nth 2 item) (nth 3 item) area new_v new_vol (nth 7 item) new_nos new_work ent_poly ent_txt))
           (setq *qto_data* (subst_nth global_idx item *qto_data*))
-
           (update_active_qto_list_ui)
-          (alert (strcat "Record Updated!\nTag: " new_tag "\nVolume: " (rtos new_vol 2 3) " m3"))
+          (alert (strcat "Record Updated!\nTag: " new_tag "\nWork: " new_work "\nVolume: " (rtos new_vol 2 3) " m3"))
         )
       )
     )
@@ -643,31 +745,61 @@
   )
 )
 
-(defun export_all_qto_csv (/ csv_file f item)
-  (if *qto_data*
+(defun export_all_qto_csv (/ def_path def_dir def_file csv_path f)
+  ;; Step 1: Drawing mathi latest taajo data force sync karo
+  (qto_sync_data_from_dwg)
+  
+  (if (null *qto_data*)
+    (alert "Export failed: No QTO elements found in drawing to export!")
     (progn
-      (setq csv_file (getfiled "Export Complete QTO Schedule" "Multi_Category_Takeoff.csv" "csv" 1))
-      (if csv_file
+      ;; Step 2: Memory Path check karo (DCL friendly)
+      (if (and *qto_csv_saved_path* (vl-filename-directory *qto_csv_saved_path*))
+        (setq def_path *qto_csv_saved_path*)
+        (setq def_path "QTO_Master_Takeoff.csv")
+      )
+
+      ;; Windows Save Dialog (Direct Memory Path par open thashe)
+      (setq csv_path (getfiled "Export / Sync Master Takeoff CSV" def_path "csv" 1))
+
+      (if csv_path
         (progn
-          (setq f (open csv_file "w"))
-          (write-line "CATEGORY,LAYER,TAG,SHAPE,LENGTH(m),WIDTH(m),AREA(m2),HEIGHT_DEPTH(m),VOLUME(m3)" f)
-          (foreach item *qto_data*
-            (write-line (strcat (nth 0 item) ","
-                                "QTO_" (strcase (nth 0 item)) ","
-                                (nth 1 item) "," 
-                                (nth 7 item) "," 
-                                (rtos (nth 2 item) 2 3) "," 
-                                (rtos (nth 3 item) 2 3) "," 
-                                (rtos (nth 4 item) 2 3) "," 
-                                (rtos (nth 5 item) 2 3) "," 
-                                (rtos (nth 6 item) 2 3)) f)
+          ;; Path memory ma save karo
+          (setq *qto_csv_saved_path* csv_path)
+          
+          ;; "w" (Write/Overwrite mode) -> Full Sync Mirror
+          (setq f (open csv_path "w"))
+          (if f
+            (progn
+              ;; CSV Header row
+              (write-line "CATEGORY,LAYER,TAG,SHAPE,NOS,LENGTH(m),WIDTH(m),AREA(m2),HEIGHT_DEPTH(m),VOLUME(m3),WORK" f)
+              
+              ;; Current Drawing Data Fresh Write
+              (foreach item *qto_data*
+                (write-line 
+                  (strcat 
+                    (nth 0 item) ","
+                    "QTO_" (strcase (nth 0 item)) ","
+                    (nth 1 item) ","
+                    (nth 7 item) ","
+                    (itoa (if (nth 8 item) (nth 8 item) 1)) ","
+                    (rtos (nth 2 item) 2 3) ","
+                    (rtos (nth 3 item) 2 3) ","
+                    (rtos (nth 4 item) 2 3) ","
+                    (rtos (nth 5 item) 2 3) ","
+                    (rtos (nth 6 item) 2 3) ","
+                    (if (> (length item) 9) (nth 9 item) "Regular")
+                  ) 
+                  f
+                )
+              )
+              (close f)
+              (alert (strcat "Full Sync Complete!\n\nAll entities synced cleanly to:\n" csv_path))
+            )
+            (alert "Error: Cannot write to CSV file!\nPlease close the CSV file if it is currently open in Microsoft Excel.")
           )
-          (close f)
-          (alert (strcat "Takeoff Schedule Exported Successfully:\n" csv_file))
         )
       )
     )
-    (alert "No takeoff data available to export.")
   )
 )
 
