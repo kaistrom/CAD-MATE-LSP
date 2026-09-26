@@ -786,14 +786,15 @@
   s_list
 )
 
-;; ==========================================================================
-;; AUTO BEAM-TO-COLUMN JUNCTION INTERSECTION & DEDUCTION ENGINE
-;; ==========================================================================
+
+;; Combined Scanner: Beams + Wall Deductions with Independent Height & Wall-1 Tag
 (defun qto_get_column_beam_deduction_details (col_ent / col_obj minpt maxpt ss i bm_ent bm_obj
                                                        int_pts n_pts pt1 pt2 contact_w bm_xdata
                                                        bm_depth ded_area bm_tag details_list
                                                        ins_unit to_m pts n_v j p_start p_end
-                                                       mid_pt d1 d2 d_seg hit_side)
+                                                       mid_pt d1 d2 d_seg hit_side col_h
+                                                       ss_w w_ent w_obj w_pts w_p1 w_p2 w_len w_mid
+                                                       w_xdata w_h wall_count w_tag)
   (vl-load-com)
   (setq details_list nil)
   (setq ins_unit (getvar "INSUNITS"))
@@ -809,6 +810,13 @@
       (setq pts (get_clean_poly_vertices col_ent))
       (setq n_v (length pts))
 
+      ;; Column XData Height (Fallback mate)
+      (setq bm_xdata (assoc "QTO_DATA_APP" (cdr (assoc -3 (entget col_ent '("QTO_DATA_APP"))))))
+      (setq col_h (if bm_xdata (cdr (nth 3 bm_xdata)) 3.0))
+
+      ;; -------------------------------------------------------------
+      ;; PART 1: CONNECTED BEAMS SCAN
+      ;; -------------------------------------------------------------
       (setq ss (ssget "C" minpt maxpt '((0 . "LWPOLYLINE,POLYLINE") (8 . "QTO_BEAMS"))))
       (if ss
         (progn
@@ -841,7 +849,6 @@
                           (setq d_seg (distance p_start p_end))
                           (setq d1    (distance p_start mid_pt))
                           (setq d2    (distance mid_pt p_end))
-                          
                           (if (< (abs (- (+ d1 d2) d_seg)) 2.0)
                             (setq hit_side (1+ j))
                           )
@@ -856,13 +863,86 @@
                             (if (and bm_depth (> bm_depth 0.0) (> contact_w 0.0))
                               (progn
                                 (setq ded_area (* (* contact_w to_m) (if (> bm_depth 10.0) (* bm_depth to_m) bm_depth)))
-                                (setq details_list (append details_list (list (list bm_tag contact_w bm_depth ded_area hit_side))))
+                                (setq details_list (append details_list (list (list bm_tag contact_w bm_depth ded_area hit_side "Beam"))))
                               )
                             )
                           )
                         )
                       )
                     )
+                  )
+                )
+              )
+            )
+            (setq i (1+ i))
+          )
+        )
+      )
+
+      ;; -------------------------------------------------------------
+      ;; PART 2: MASONRY WALLS SCAN (Layer: QTO_WALLS)
+      ;; -------------------------------------------------------------
+      (setq ss_w (ssget "C" minpt maxpt '((0 . "LINE,LWPOLYLINE") (8 . "QTO_WALLS"))))
+      (if ss_w
+        (progn
+          (setq i 0)
+          (setq wall_count 1)
+          (repeat (sslength ss_w)
+            (setq w_ent (ssname ss_w i))
+            
+            ;; Check if Wall has its own XData Height (Depth/Height param)
+            (setq w_xdata (assoc "QTO_DATA_APP" (cdr (assoc -3 (entget w_ent '("QTO_DATA_APP"))))))
+            (setq w_h (if w_xdata 
+                        (cdr (nth 3 w_xdata))  ;; દીવાલની પોતાની હાઈટ
+                        col_h                  ;; ન હોય તો કોલમ હાઈટ ફોલબેક
+                      ))
+            (setq w_tag (if w_xdata (cdr (nth 2 w_xdata)) (strcat "Wall-" (itoa wall_count))))
+
+            ;; Line ના પોઈન્ટ્સ
+            (if (= (cdr (assoc 0 (entget w_ent))) "LINE")
+              (progn
+                (setq w_p1 (cdr (assoc 10 (entget w_ent))))
+                (setq w_p2 (cdr (assoc 11 (entget w_ent))))
+              )
+              (progn
+                (setq w_pts (get_clean_poly_vertices w_ent))
+                (setq w_p1 (car w_pts))
+                (setq w_p2 (cadr w_pts))
+              )
+            )
+
+            (if (and w_p1 w_p2)
+              (progn
+                (setq w_len (distance w_p1 w_p2))
+                (setq w_mid (list (/ (+ (car w_p1) (car w_p2)) 2.0)
+                                  (/ (+ (cadr w_p1) (cadr w_p2)) 2.0)
+                                  0.0))
+
+                 
+                (setq hit_side 1)
+                (setq j 0)
+                (while (< j n_v)
+                  (setq p_start (nth j pts))
+                  (setq p_end   (if (< (1+ j) n_v) (nth (1+ j) pts) (nth 0 pts)))
+                  (setq d_seg (distance p_start p_end))
+                  (setq d1    (distance p_start w_mid))
+                  (setq d2    (distance w_mid p_end))
+                  (if (< (abs (- (+ d1 d2) d_seg)) 5.0)
+                    (setq hit_side (1+ j))
+                  )
+                  (setq j (1+ j))
+                )
+
+                (if (> w_len 0.0)
+                  (progn
+                    ;; Calculation: Wall Contact Length * Wall Height
+                    (setq ded_area (* (* w_len to_m) (if (> w_h 50.0) (* w_h to_m) w_h)))
+                    (setq details_list 
+                      (append details_list 
+                        (list (list w_tag w_len w_h ded_area hit_side "Wall"))
+                      )
+                    )
+                    (setq wall_count (1+ wall_count))
                   )
                 )
               )
@@ -1079,7 +1159,9 @@
           (setq f (open csv_path "w"))
           (if f
             (progn
+              ;; Headers for Pivot & Filters
               (write-line "PARENT_TAG,ITEM_TAG,ROW_TYPE,CATEGORY,SHAPE,NOS,L(m),W(m),H(m),PERIMETER(m),SHUTTER_AREA(m2)" f)
+              
               (foreach item records
                 (setq ent (nth 10 item))
                 (setq res (qto_calculate_shutter_item item))
@@ -1095,39 +1177,41 @@
                                        (if (> h_val 50.0) (/ h_val 1000.0) h_val) 
                                        nos_val))
 
+                ;; 1. Gross Parent Row
                 (write-line
                   (strcat
-                    tag_str ","
-                    tag_str ","
-                    "Gross" ","
-                    (nth 0 item) ","
-                    shape_str ","
-                    (itoa nos_val) ","
-                    (rtos l_val 2 3) ","
-                    (rtos w_val 2 3) ","
-                    (rtos h_val 2 3) ","
-                    (rtos p_val 2 3) ","
-                    (rtos gross_shutter 2 3)
+                    tag_str ","                  ;; PARENT_TAG
+                    tag_str ","                  ;; ITEM_TAG
+                    "Gross" ","                  ;; ROW_TYPE
+                    (nth 0 item) ","             ;; CATEGORY
+                    shape_str ","                ;; SHAPE
+                    (itoa nos_val) ","           ;; NOS
+                    (rtos l_val 2 3) ","         ;; L
+                    (rtos w_val 2 3) ","         ;; W
+                    (rtos h_val 2 3) ","         ;; H
+                    (rtos p_val 2 3) ","         ;; PERIMETER
+                    (rtos gross_shutter 2 3)     ;; GROSS SHUTTER
                   )
                   f
                 )
 
+                ;; 2. Deduction Child Rows (BM-1, Wall-1 sathe independent Height)
                 (setq bm_ded_list (if ent (qto_get_column_beam_deduction_details ent) nil))
                 (if bm_ded_list
                   (foreach bm_item bm_ded_list
                     (write-line
                       (strcat
-                        tag_str ","
-                        (strcat "Deduct: " (nth 0 bm_item)) ","
-                        "Deduction" ","
-                        (nth 0 item) ","
-                        "Junction" ","
-                        "1" ","
-                        "-" ","
-                        (rtos (nth 1 bm_item) 2 1) ","
-                        (rtos (nth 2 bm_item) 2 1) ","
-                        "-" ","
-                        (strcat "-" (rtos (nth 3 bm_item) 2 3))
+                        tag_str ","                                                     ;; PARENT_TAG
+                        (nth 0 bm_item) ","                                             ;; ITEM_TAG (e.g. Wall-1, BM-1)
+                        "Deduction" ","                                                 ;; ROW_TYPE
+                        (nth 0 item) ","                                                ;; CATEGORY
+                        (if (equal (nth 5 bm_item) "Wall") "Masonry" "Junction") ","    ;; SHAPE
+                        "1" ","                                                         ;; NOS
+                        "-" ","                                                         ;; L
+                        (rtos (nth 1 bm_item) 2 1) ","                                  ;; Contact Length / Width
+                        (rtos (nth 2 bm_item) 2 1) ","                                  ;; Independent Wall Height / Beam Depth
+                        "-" ","                                                         ;; PERIMETER
+                        (strcat "-" (rtos (nth 3 bm_item) 2 3))                         ;; DEDUCT SHUTTER AREA
                       )
                       f
                     )
@@ -1285,18 +1369,18 @@
     (vla-SetText tbl row col (rtos gross_shutter 2 3))
     (setq row (1+ row))
 
-    ;; Deduction Sub-Rows
+;; Deduction Sub-Rows (Beams & Walls)
     (if bm_ded_list
       (foreach bm_item bm_ded_list
         (setq beam_side_idx (nth 4 bm_item))
         (vla-SetText tbl row 0 tag_str)
-        (vla-SetText tbl row 1 (strcat "Deduct: " (nth 0 bm_item)))
+        (vla-SetText tbl row 1 (nth 0 bm_item)) ;; હવે સીધું "Wall-1" અથવા "BM-1" આવશે
         (vla-SetText tbl row 2 "Deduction")
-        (vla-SetText tbl row 3 "Junction")
+        (vla-SetText tbl row 3 (if (equal (nth 5 bm_item) "Wall") "Masonry" "Junction"))
         (vla-SetText tbl row 4 "1")
         (vla-SetText tbl row 5 "-")
-        (vla-SetText tbl row 6 (rtos (nth 1 bm_item) 2 1))
-        (vla-SetText tbl row 7 (rtos (nth 2 bm_item) 2 1))
+        (vla-SetText tbl row 6 (rtos (nth 1 bm_item) 2 1)) ;; Contact Length / Width
+        (vla-SetText tbl row 7 (rtos (nth 2 bm_item) 2 1)) ;; Wall Height (પોતાની ઊંચાઈ)
         (vla-SetText tbl row 8 "-")
 
         (setq col 9)
@@ -1331,5 +1415,23 @@
   (vla-update tbl)
 
   (princ "\nDynamic Shuttering Table generated cleanly without error!\n")
+  (princ)
+)
+
+
+;; Command to Delete or Reset a Category
+(defun c:QTO_DEL_CAT (/ cat_del)
+  (vl-load-com)
+  (setq cat_del (getstring T "\nEnter Category Name to Remove (e.g. Wall): "))
+  (if (and cat_del (> (strlen cat_del) 0))
+    (progn
+      (setq *qto_categories* 
+        (vl-remove-if '(lambda (x) (equal (strcase (car x)) (strcase cat_del))) *qto_categories*)
+      )
+      (qto_save_categories_to_dwg)
+      (setq *qto_active_cat* "Columns")
+      (alert (strcat "Category [" cat_del "] removed successfully from Drawing!"))
+    )
+  )
   (princ)
 )
